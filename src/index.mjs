@@ -3,7 +3,7 @@
 
 // Entry point.
 import { logger } from './lib/logger.mjs';
-import { checkYtDlpBinary, sweepStaleTempDirs } from './lib/ytdlp.mjs';
+import { checkMediaTools, checkYtDlpBinary, sweepStaleTempDirs } from './lib/ytdlp.mjs';
 import { getRedisClient, isRedisConfigured } from './lib/redis.mjs';
 import { startCookieManager } from './lib/cookies.mjs';
 
@@ -46,7 +46,24 @@ try {
   logger.error({ err }, 'yt-dlp binary check failed — media endpoints will not work');
 }
 
+// Cookies first: impersonation probing and every later yt-dlp call read the
+// jars that startCookieManager() sets up.
 await startCookieManager();
+
+// ffmpeg/ffprobe are what make merged video+audio and mp3/m4a extraction
+// possible. Plenty of sites only offer split streams, so running without
+// ffmpeg quietly limits which sources work — say so loudly at startup
+// instead of failing per request. Surfaced at GET /api/capabilities too.
+const tools = await checkMediaTools();
+if (tools.ffmpeg && tools.ffprobe) {
+  logger.info('ffmpeg and ffprobe found — merging, remuxing and audio extraction available');
+} else {
+  logger.warn(
+    tools,
+    'ffmpeg/ffprobe missing — sources that need merging (most DASH/HLS sites) and ' +
+      'mp3/m4a conversion will fail. Install ffmpeg, or use the bundled Dockerfile.',
+  );
+}
 
 // Attempt the Redis connection here, before app.mjs (and the route modules
 // it pulls in) are evaluated — app.mjs and media.mjs each decide, once, at

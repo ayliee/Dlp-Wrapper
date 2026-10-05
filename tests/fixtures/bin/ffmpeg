@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "ffmpeg version 0.0-fake"

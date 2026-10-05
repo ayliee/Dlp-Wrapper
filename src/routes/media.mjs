@@ -3,28 +3,55 @@
 
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
-import { createReadStream, statSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  cookieArgs,
+  DOWNLOAD_EXTS,
+  downloadToDir,
   fetchMediaInfo,
+  listExtractors,
   resolveDirectUrls,
-  spawnDownload,
   TEMP_DIR_PREFIX,
   YtDlpError,
 } from '../lib/ytdlp.mjs';
-import { assertPublicHttpUrl, safeEqual, Semaphore, SsrfError } from '../lib/security.mjs';
+import {
+  assertPublicHttpUrl,
+  normalizeInputUrl,
+  safeEqual,
+  Semaphore,
+  SsrfError,
+} from '../lib/security.mjs';
+import { buildDownloadName, contentDispositionFor, contentTypeFor } from '../lib/files.mjs';
 import { buildRateLimitStore } from '../lib/rateLimitStore.mjs';
 import { cacheGet, cacheSet } from '../lib/cache.mjs';
 import { incrementQuota } from '../lib/quota.mjs';
-import { activeJobs, cacheEvents, quotaRejections } from '../lib/metrics.mjs';
+import { activeJobs, cacheEvents, extractionResults, quotaRejections } from '../lib/metrics.mjs';
 
 const router = Router();
 
-function sendError(res, status, message) {
-  res.status(status).json({ error: message });
+function sendError(res, status, message, extra = {}) {
+  if (res.headersSent) return;
+  res.status(status).json({ error: message, ...extra });
+}
+
+/** Map a YtDlpError onto a real status code + machine-readable code/hint. */
+function sendYtDlpError(res, req, err, fallbackMessage) {
+  if (err instanceof YtDlpError) {
+    if (err.code === 'cancelled') return; // client went away; nothing to send
+    extractionResults.inc({ result: err.code });
+    req.log?.warn({ code: err.code, detail: err.detail }, 'yt-dlp extraction failed');
+    sendError(res, err.status, err.message, {
+      code: err.code,
+      ...(err.hint ? { hint: err.hint } : {}),
+      ...(err.detail && err.detail !== err.message ? { detail: err.detail } : {}),
+    });
+    return;
+  }
+  req.log?.error({ err }, fallbackMessage);
+  extractionResults.inc({ result: 'internal_error' });
+  sendError(res, 500, fallbackMessage, { code: 'internal_error' });
 }
 
 /**
@@ -35,17 +62,30 @@ function requireApiKey(req, res) {
   const configuredKey = process.env.API_KEY;
   if (!configuredKey) return true;
 
-  const providedKey = req.header('x-api-key');
+  const providedKey = req.header('x-api-key') ?? bearerToken(req);
   if (providedKey && safeEqual(providedKey, configuredKey)) return true;
 
-  sendError(res, 401, 'Invalid or missing API key');
+  sendError(res, 401, 'Invalid or missing API key', { code: 'unauthorized' });
   return false;
 }
 
+/** Some HTTP clients only speak Authorization headers — accept both. */
+function bearerToken(req) {
+  const header = req.header('authorization');
+  if (!header) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match ? match[1] : null;
+}
+
 function parseUrlParam(req, res) {
-  const url = req.query.url;
-  if (typeof url !== 'string' || url.trim().length === 0) {
-    sendError(res, 400, "Query parameter 'url' is required");
+  const raw = req.query.url ?? req.body?.url;
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    sendError(res, 400, "Query parameter 'url' is required", { code: 'missing_url' });
+    return null;
+  }
+  const url = normalizeInputUrl(raw);
+  if (!url) {
+    sendError(res, 400, "Query parameter 'url' is required", { code: 'missing_url' });
     return null;
   }
   return url;
@@ -58,28 +98,72 @@ async function assertUrlIsSafe(url, req, res) {
     return true;
   } catch (err) {
     if (err instanceof SsrfError) {
-      sendError(res, 400, err.message);
+      sendError(res, 400, err.message, { code: 'invalid_url' });
       return false;
     }
     req.log?.error({ err }, 'Unexpected error validating url');
-    sendError(res, 400, 'Invalid url');
+    sendError(res, 400, 'Invalid url', { code: 'invalid_url' });
     return false;
   }
 }
 
-// yt-dlp format selectors are built from a small character set (format ids,
-// +, *, /, [], (), digits, letters, :, comparison operators). No need to
-// accept anything outside that before it reaches the CLI.
-const SAFE_FORMAT_RE = /^[a-zA-Z0-9_\-+*/,.:<>=\[\]() ]{1,200}$/;
+// yt-dlp format selectors are built from a small character set: format ids,
+// +, *, /, [], (), comparison operators (<, >, =, !=, ^=, $=, *=, ~=), and
+// quoted regexes for codec matching.
+const SAFE_FORMAT_RE = /^[a-zA-Z0-9_\-+*/,.:<>=!~^$&|?'"\[\]() ]{1,300}$/;
 
 function parseFormatParam(req, res, fallback) {
   const raw = req.query.format;
-  if (raw === undefined) return fallback;
+  if (raw === undefined || raw === '') return fallback;
   if (typeof raw !== 'string' || !SAFE_FORMAT_RE.test(raw)) {
-    sendError(res, 400, "Query parameter 'format' is invalid");
+    sendError(res, 400, "Query parameter 'format' is invalid", { code: 'invalid_format' });
     return null;
   }
   return raw;
+}
+
+function parseBool(value, fallback = false) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+/** 1-based playlist item selector (`item=3`). Returns undefined when absent. */
+function parseItemParam(req, res) {
+  const raw = req.query.item ?? req.query.index;
+  if (raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 10_000) {
+    sendError(res, 400, "Query parameter 'item' must be a positive integer", { code: 'invalid_item' });
+    return undefined;
+  }
+  return n;
+}
+
+const PLAYLIST_LIMIT_MAX = Number(process.env.PLAYLIST_MAX_ITEMS ?? 200);
+
+function parseLimitParam(req, res) {
+  const raw = req.query.limit;
+  if (raw === undefined || raw === '') return 50;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > PLAYLIST_LIMIT_MAX) {
+    sendError(res, 400, `Query parameter 'limit' must be between 1 and ${PLAYLIST_LIMIT_MAX}`, {
+      code: 'invalid_limit',
+    });
+    return undefined;
+  }
+  return n;
+}
+
+/** AbortSignal that fires when the client hangs up, so yt-dlp dies with it. */
+function abortOnDisconnect(req, res) {
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on('close', onClose);
+  res.on('close', () => req.off('close', onClose));
+  return controller.signal;
 }
 
 // ---------------- concurrency: immediate-reject or queued ----------------
@@ -107,7 +191,7 @@ async function acquireSlot(semaphore, kind, req, res, busyMessage) {
     : semaphore.tryAcquire();
 
   if (!acquired) {
-    sendError(res, 429, busyMessage);
+    sendError(res, 429, busyMessage, { code: 'server_busy' });
     return false;
   }
   if (req.destroyed || res.writableEnded) {
@@ -140,7 +224,9 @@ async function enforceQuota(route, max, req, res) {
 
   quotaRejections.inc({ route });
   res.setHeader('Retry-After', String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))));
-  sendError(res, 429, `Daily quota exceeded for this endpoint — resets ${new Date(resetAt).toISOString()}`);
+  sendError(res, 429, `Daily quota exceeded for this endpoint — resets ${new Date(resetAt).toISOString()}`, {
+    code: 'quota_exceeded',
+  });
   return false;
 }
 
@@ -159,28 +245,36 @@ const downloadLimiter = rateLimit({
   legacyHeaders: false,
   store: buildRateLimitStore('dlpwrapper:rl:download:'),
   passOnStoreError: true, // same reasoning as the general limiter in app.mjs
-  message: { error: 'Too many download requests — please slow down' },
+  message: { error: 'Too many download requests — please slow down', code: 'rate_limited' },
 });
 
-/** Passed to yt-dlp's own --max-filesize so oversized files never hit disk. */
-const MAX_FILESIZE = process.env.YTDLP_MAX_FILESIZE;
-function maxFilesizeArgs() {
-  return MAX_FILESIZE ? ['--max-filesize', MAX_FILESIZE] : [];
-}
-
 /**
- * GET /api/media/info?url=<url>
- * Metadata for any yt-dlp-supported URL: title, thumbnail, duration, formats.
- * Cached for CACHE_TTL_INFO_MS since the same url is often requested repeatedly.
+ * GET /api/media/info?url=<url>[&playlist=true&limit=50][&item=2]
+ *
+ * Metadata for any yt-dlp-supported URL: title, thumbnail, duration,
+ * uploader, live status and the full format list.
+ *
+ * Sources that bundle several clips into one post (Twitter threads, Reddit
+ * galleries, TikTok photo carousels, Instagram multi-item posts) come back
+ * as the first item plus a `partOfPlaylist` summary; pass playlist=true to
+ * get every entry instead.
  */
 router.get('/media/info', async (req, res) => {
   if (!requireApiKey(req, res)) return;
   const url = parseUrlParam(req, res);
   if (!url) return;
   if (!(await assertUrlIsSafe(url, req, res))) return;
+
+  const item = parseItemParam(req, res);
+  if (item === undefined) return;
+  const limit = parseLimitParam(req, res);
+  if (limit === undefined) return;
+  const playlist = parseBool(req.query.playlist);
+
   if (!(await enforceQuota('info', QUOTA_MAX_INFO, req, res))) return;
 
-  const cached = await cacheGet('info', [url]);
+  const cacheKey = [url, `playlist=${playlist}`, `limit=${limit}`, `item=${item ?? ''}`];
+  const cached = await cacheGet('info', cacheKey);
   if (cached) {
     cacheEvents.inc({ namespace: 'info', result: 'hit' });
     res.json(cached);
@@ -191,25 +285,28 @@ router.get('/media/info', async (req, res) => {
   if (!(await acquireSlot(infoSemaphore, 'info', req, res, 'Server is busy — please retry shortly'))) return;
 
   try {
-    const info = await fetchMediaInfo(url);
-    await cacheSet('info', [url], info, CACHE_TTL_INFO_MS);
+    const info = await fetchMediaInfo(url, { playlist, limit, item, signal: abortOnDisconnect(req, res) });
+    extractionResults.inc({ result: 'ok' });
+    await cacheSet('info', cacheKey, info, CACHE_TTL_INFO_MS);
     res.json(info);
   } catch (err) {
-    req.log?.error({ err }, 'Failed to fetch media info');
-    const message = err instanceof YtDlpError ? err.message : 'Failed to extract media info';
-    sendError(res, 422, message);
+    sendYtDlpError(res, req, err, 'Failed to extract media info');
   } finally {
     releaseSlot(infoSemaphore, 'info');
   }
 });
 
 /**
- * GET /api/media/direct-url?url=<url>&format=best
+ * GET /api/media/direct-url?url=<url>[&format=<selector>][&item=2]
+ *
  * Resolves the underlying CDN URL(s) with no bytes routed through this
- * server — good for Discord embeds or `<video src>`. Some CDNs 403 without
- * the original request headers; fall back to /media/download if so.
- * Cached briefly — CDN URLs usually carry short-lived expiry tokens, so the
- * TTL here is intentionally shorter than /media/info's.
+ * server — good for Discord embeds or `<video src>`.
+ *
+ * Each entry in `streams` carries the protocol and the HTTP headers the CDN
+ * expects: plenty of sites (Instagram, TikTok, Facebook, Bilibili) 403 a
+ * direct URL fetched without the original Referer/User-Agent, and HLS/DASH
+ * entries (`isManifest: true`) need a player rather than a plain GET.
+ * Fall back to /media/download when either gets in the way.
  */
 router.get('/media/direct-url', async (req, res) => {
   if (!requireApiKey(req, res)) return;
@@ -217,11 +314,14 @@ router.get('/media/direct-url', async (req, res) => {
   if (!url) return;
   if (!(await assertUrlIsSafe(url, req, res))) return;
 
-  const format = parseFormatParam(req, res, 'best');
+  const format = parseFormatParam(req, res, '');
   if (format === null) return;
+  const item = parseItemParam(req, res);
+  if (item === undefined) return;
   if (!(await enforceQuota('direct-url', QUOTA_MAX_DIRECT_URL, req, res))) return;
 
-  const cached = await cacheGet('direct-url', [url, format]);
+  const cacheKey = [url, `format=${format}`, `item=${item ?? ''}`];
+  const cached = await cacheGet('direct-url', cacheKey);
   if (cached) {
     cacheEvents.inc({ namespace: 'direct-url', result: 'hit' });
     res.json(cached);
@@ -232,30 +332,29 @@ router.get('/media/direct-url', async (req, res) => {
   if (!(await acquireSlot(infoSemaphore, 'info', req, res, 'Server is busy — please retry shortly'))) return;
 
   try {
-    const result = await resolveDirectUrls(url, format);
-    await cacheSet('direct-url', [url, format], result, CACHE_TTL_DIRECT_URL_MS);
+    const result = await resolveDirectUrls(url, format, { item, signal: abortOnDisconnect(req, res) });
+    extractionResults.inc({ result: 'ok' });
+    await cacheSet('direct-url', cacheKey, result, CACHE_TTL_DIRECT_URL_MS);
     res.json(result);
   } catch (err) {
-    req.log?.error({ err }, 'Failed to resolve direct url');
-    const message = err instanceof YtDlpError ? err.message : 'Failed to resolve direct url';
-    sendError(res, 422, message);
+    sendYtDlpError(res, req, err, 'Failed to resolve direct url');
   } finally {
     releaseSlot(infoSemaphore, 'info');
   }
 });
 
 /**
- * GET /api/media/download?url=<url>&ext=mp4|mp3&format=<selector>
- * Streams the file back as an attachment: yt-dlp downloads into a temp dir,
- * then we pipe that file to the response. Never cached — this is a stream,
- * not a storable value.
+ * GET /api/media/download?url=<url>[&ext=mp4|mp3|m4a|opus|webm|audio|auto]
+ *                        [&format=<selector>][&item=2][&allowLive=true]
  *
- * `format` defaults to `bestvideo*+bestaudio/best` (best muxed-with-audio
- * stream, falling back to best combined stream, merged into mp4 by ffmpeg
- * when needed). Pass `format=best` to skip the merge.
+ * Streams the media back as an attachment: yt-dlp downloads into a temp
+ * dir, then we pipe the file to the response.
  *
- * We readdir the temp dir rather than trust yt-dlp's stdout for the output
- * filename, since post-processors can leave sidecar files (.part, .description).
+ * `ext` is best-effort, not a promise to transcode: a webm-only source
+ * requested as mp4 is remuxed when the codecs allow it and otherwise comes
+ * back in its original container — the Content-Type and filename always
+ * describe what's actually in the body. Use ext=auto to skip conversion
+ * entirely (fastest, works everywhere), or ext=mp3/m4a/opus for audio.
  */
 router.get('/media/download', downloadLimiter, async (req, res) => {
   if (!requireApiKey(req, res)) return;
@@ -264,130 +363,114 @@ router.get('/media/download', downloadLimiter, async (req, res) => {
   if (!(await assertUrlIsSafe(url, req, res))) return;
 
   const rawExt = req.query.ext;
-  if (rawExt !== undefined && rawExt !== 'mp3' && rawExt !== 'mp4') {
-    sendError(res, 400, "Query parameter 'ext' must be 'mp3' or 'mp4'");
+  const ext = rawExt === undefined || rawExt === '' ? 'mp4' : String(rawExt).toLowerCase();
+  if (!DOWNLOAD_EXTS.includes(ext)) {
+    sendError(res, 400, `Query parameter 'ext' must be one of: ${DOWNLOAD_EXTS.join(', ')}`, {
+      code: 'invalid_ext',
+    });
     return;
   }
-  const ext = rawExt === 'mp3' ? 'mp3' : 'mp4';
 
-  const format = parseFormatParam(req, res, 'bestvideo*+bestaudio/best');
-  if (format === null) return;
+  const format = parseFormatParam(req, res, null);
+  if (format === null && req.query.format !== undefined && req.query.format !== '') return;
+  const item = parseItemParam(req, res);
+  if (item === undefined) return;
+  const allowLive = parseBool(req.query.allowLive);
+
   if (!(await enforceQuota('download', QUOTA_MAX_DOWNLOADS, req, res))) return;
 
   if (!(await acquireSlot(downloadSemaphore, 'download', req, res, 'Too many downloads in progress — please retry shortly'))) return;
 
-  // mkdtemp can fail (disk full, permissions) — without this guard, the
-  // rejection was unhandled here (Express 4 doesn't forward async
-  // rejections to error middleware automatically), which crashed the whole
-  // process for every in-flight request, not just this one.
+  // mkdtemp can fail (disk full, permissions) — without this guard the
+  // rejection is unhandled (Express 4 doesn't forward async rejections to
+  // error middleware), which takes down every in-flight request, not just
+  // this one.
   let workDir;
   try {
     workDir = await mkdtemp(path.join(tmpdir(), TEMP_DIR_PREFIX));
   } catch (err) {
     req.log?.error({ err }, 'Failed to create temp download directory');
     releaseSlot(downloadSemaphore, 'download');
-    sendError(res, 500, 'Failed to prepare download');
+    sendError(res, 500, 'Failed to prepare download', { code: 'internal_error' });
     return;
   }
-  const outputTemplate = path.join(workDir, '%(id)s.%(ext)s');
 
-  const args =
-    ext === 'mp3'
-      ? [
-          '-f', 'bestaudio/best',
-          '-x', '--audio-format', 'mp3',
-          '--no-playlist', '--no-warnings',
-          ...maxFilesizeArgs(),
-          ...cookieArgs(),
-          '-o', outputTemplate,
-          url,
-        ]
-      : [
-          '-f', format,
-          '--merge-output-format', 'mp4',
-          '--no-playlist', '--no-warnings',
-          ...maxFilesizeArgs(),
-          ...cookieArgs(),
-          '-o', outputTemplate,
-          url,
-        ];
-
-  const child = spawnDownload(args);
-  let slotReleased = false;
-  const releaseOnce = () => {
-    if (slotReleased) return;
-    slotReleased = true;
-    releaseSlot(downloadSemaphore, 'download');
-  };
-
-  let stderr = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
-  });
-
+  let released = false;
   const cleanup = () => {
-    releaseOnce();
+    if (!released) {
+      released = true;
+      releaseSlot(downloadSemaphore, 'download');
+    }
     rm(workDir, { recursive: true, force: true }).catch((err) => {
       req.log?.warn({ err, workDir }, 'Failed to clean up temp download dir');
     });
   };
 
-  child.on('error', (err) => {
-    req.log?.error({ err }, 'yt-dlp process failed to start');
-    if (!res.headersSent) sendError(res, 422, 'Failed to start download');
-    cleanup();
-  });
+  try {
+    const { file } = await downloadToDir({
+      url,
+      workDir,
+      ext,
+      format: format || null,
+      allowLive,
+      item,
+      signal: abortOnDisconnect(req, res),
+    });
 
-  child.on('close', async (code) => {
-    if (code !== 0) {
-      req.log?.error({ code, stderr: stderr.slice(-1000) }, 'yt-dlp download failed');
-      if (!res.headersSent) sendError(res, 422, stderr.trim().slice(-500) || 'Download failed');
+    if (res.writableEnded || req.destroyed) {
       cleanup();
       return;
     }
 
-    try {
-      const files = await readdir(workDir);
-      const SKIP_EXTS = new Set([
-        '.part', '.ytdl', '.json', '.description', '.annotations',
-        '.info.json', '.live_chat.json',
-      ]);
-      const mediaFiles = files.filter((f) => !SKIP_EXTS.has(path.extname(f).toLowerCase()));
-      const outputFile = mediaFiles[0];
-      if (!outputFile) {
-        throw new Error(
-          files.length > 0
-            ? `Download produced no usable media file (found: ${files.join(', ')})`
-            : 'Download produced no output files',
-        );
-      }
+    const downloadName = buildDownloadName(file.name);
+    res.setHeader('Content-Disposition', contentDispositionFor(downloadName));
+    // Derived from the file we actually produced, not from what was asked
+    // for — those differ whenever a remux wasn't possible.
+    res.setHeader('Content-Type', contentTypeFor(file.name));
+    res.setHeader('Content-Length', String(file.size));
+    res.setHeader('X-Media-Filename', encodeURIComponent(downloadName));
+    extractionResults.inc({ result: 'ok' });
 
-      const filePath = path.join(workDir, outputFile);
-      const { size } = statSync(filePath);
-      const contentType = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4';
-
-      res.setHeader('Content-Disposition', `attachment; filename="${outputFile}"`);
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Content-Length', String(size));
-
-      const readStream = createReadStream(filePath);
-      readStream.pipe(res);
-      readStream.on('close', cleanup);
-      readStream.on('error', (err) => {
-        req.log?.error({ err }, 'Error streaming downloaded file');
-        cleanup();
-      });
-    } catch (err) {
-      req.log?.error({ err }, 'Failed to locate downloaded file');
-      if (!res.headersSent) sendError(res, 422, 'Download produced no output');
+    const readStream = createReadStream(file.path);
+    readStream.on('error', (err) => {
+      req.log?.error({ err }, 'Error streaming downloaded file');
+      if (!res.headersSent) sendError(res, 500, 'Failed to stream download', { code: 'internal_error' });
+      res.destroy();
       cleanup();
-    }
-  });
+    });
+    readStream.on('close', cleanup);
+    readStream.pipe(res);
+  } catch (err) {
+    sendYtDlpError(res, req, err, 'Download failed');
+    cleanup();
+  }
+});
 
-  // Client disconnected mid-download — kill yt-dlp to save bandwidth.
-  req.on('close', () => {
-    if (!res.writableEnded) child.kill('SIGKILL');
-  });
+/**
+ * GET /api/media/extractors[?query=tiktok][&limit=100]
+ *
+ * The list of sites this yt-dlp build supports, straight from the binary —
+ * handy for checking whether a source is covered before wiring it up.
+ */
+router.get('/media/extractors', async (req, res) => {
+  if (!requireApiKey(req, res)) return;
+
+  const query = typeof req.query.query === 'string' ? req.query.query.trim().toLowerCase() : '';
+  const limitRaw = Number(req.query.limit ?? 100);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 5000) : 100;
+
+  try {
+    const all = await listExtractors();
+    const matched = query ? all.filter((name) => name.toLowerCase().includes(query)) : all;
+    res.json({
+      total: all.length,
+      matched: matched.length,
+      query: query || null,
+      extractors: matched.slice(0, limit),
+    });
+  } catch (err) {
+    sendYtDlpError(res, req, err, 'Failed to list extractors');
+  }
 });
 
 export default router;

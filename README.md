@@ -30,19 +30,27 @@
 
 ## What this is
 
-A self-hosted REST API wrapping yt-dlp. Fetch metadata, resolve direct CDN URLs, or download MP4/MP3 from 1,750+ sites — drop it into a web app or a Discord bot over plain HTTP. You host it yourself; it is not a public service.
+A self-hosted REST API wrapping yt-dlp. Fetch metadata, resolve direct CDN URLs, or download video/audio from 1,750+ sites — drop it into a web app or a Discord bot over plain HTTP. You host it yourself; it is not a public service.
+
+Every endpoint returns the same response shape whatever the source is: a video site, an audio host (SoundCloud, Bandcamp, podcasts), a live stream, an image post, a thread with several clips, or a bare `.mp4` on someone's web server.
 
 Once deployed, visiting the base URL in a browser serves a full built-in documentation page (`src/public/docs.html`) with every endpoint, parameter, example, and environment variable.
 
 ## Features
 
-- Metadata, direct-URL resolution, and MP4/MP3 download endpoints
-- SSRF-guarded URL input, constant-time API key check, closed-by-default CORS
+- Metadata, direct-URL resolution, and download endpoints (`mp4`, `webm`, `mp3`, `m4a`, `opus`, `audio`, or `auto` for the untouched source container)
+- **Normalized across every extractor** — one response shape for video, audio-only, image and live sources, with codecs inferred when a site doesn't report them and storyboard formats filtered out
+- **Multi-item posts handled** — X/Twitter threads, Reddit galleries, TikTok carousels and Instagram multi-posts collapse to the first clip, or list in full with `playlist=true`
+- **Fallback format selection** — defaults degrade muxed → merge → audio-only → video-only, and an unsatisfiable selector or failed remux is retried instead of erroring
+- **Classified errors** — login wall (403), geo-block (451), dead link (404), live stream (422), rate limit (429)… each with a machine-readable `code` and an actionable `hint`, instead of one generic 422
+- **Per-site cookie jars** (`YTDLP_COOKIES_DIR`), TLS impersonation (`YTDLP_IMPERSONATE`) and proxy support for the sites that fight back
+- `GET /api/capabilities` reports yt-dlp/ffmpeg/cookie state; `GET /api/media/extractors` lists every supported site
+- Correct `Content-Type` and RFC 6266 filenames (non-ASCII titles included) on downloads
+- SSRF-guarded URL input, constant-time API key check (`x-api-key` or `Authorization: Bearer`), closed-by-default CORS
 - Rate limiting and concurrency caps, with optional request queuing instead of immediate rejection
 - Optional Redis backing for the rate limiter, metadata cache, and per-IP quotas — falls back to in-memory if unset
 - Per-IP daily quotas, separate from short-window rate limits
-- Prometheus metrics at `/metrics`
-- Managed cookie handling for authenticated sites (YouTube), including expiry warnings
+- Prometheus metrics at `/metrics`, including per-outcome extraction counters
 
 ## Quick start (local)
 
@@ -55,7 +63,18 @@ npm start
 # → listening on http://localhost:8080
 ```
 
-Requires Node.js 20+, plus `yt-dlp` and `ffmpeg` on `PATH` (both are already bundled if you run it via Docker instead — see below).
+Requires Node.js 20+, plus `yt-dlp` and `ffmpeg`/`ffprobe` on `PATH` (all bundled if you run it via Docker instead — see below). Check what the running instance found with:
+
+```bash
+curl localhost:8080/api/capabilities
+# { "ytdlpVersion": "...", "ffmpeg": true, "ffprobe": true, "cookieDomains": [], ... }
+```
+
+Run the test suite (no network or yt-dlp binary needed — it stubs the binary with fixtures covering each source type):
+
+```bash
+npm test
+```
 
 ---
 
@@ -138,26 +157,30 @@ dlp-wrapper/
 │   ├── index.mjs              # Entry point — startup checks, Redis connect, graceful shutdown
 │   ├── app.mjs                 # Express app: middleware, rate limiting, /metrics, docs route
 │   ├── lib/
-│   │   ├── ytdlp.mjs            # yt-dlp CLI wrapper — info/direct-url/download
-│   │   ├── security.mjs         # SSRF guard, constant-time key check, concurrency semaphore
+│   │   ├── ytdlp.mjs            # yt-dlp CLI wrapper — args, retries, info/direct-url/download
+│   │   ├── normalize.mjs        # extractor-specific JSON → one stable response shape
+│   │   ├── ytdlpErrors.mjs      # yt-dlp stderr → HTTP status + code + hint
+│   │   ├── files.mjs            # output-file picking, MIME types, RFC 6266 filenames
+│   │   ├── security.mjs         # SSRF guard, URL normalization, key check, semaphore
 │   │   ├── cache.mjs            # Metadata cache (Redis or in-memory TTL)
 │   │   ├── quota.mjs            # Per-IP quota counters (Redis or in-memory)
 │   │   ├── redis.mjs            # Shared optional Redis client
 │   │   ├── rateLimitStore.mjs   # Redis-or-memory store for express-rate-limit
 │   │   ├── metrics.mjs          # Prometheus metrics (prom-client)
-│   │   ├── cookies.mjs          # Cookie file sync, refresh, expiry warnings
+│   │   ├── cookies.mjs          # Per-site cookie jars: sync, refresh, expiry warnings
 │   │   └── logger.mjs           # Pino logger
 │   ├── routes/
 │   │   ├── index.mjs            # Route mounting
-│   │   ├── health.mjs           # GET /healthz
-│   │   └── media.mjs            # GET /media/info, /media/direct-url, /media/download
+│   │   ├── health.mjs           # GET /healthz, /capabilities
+│   │   └── media.mjs            # GET /media/info, /media/direct-url, /media/download, /media/extractors
 │   └── public/
 │       └── docs.html            # Built-in documentation page, served at GET /
 ├── examples/
 │   ├── discord-bot/             # Minimal discord.js integration
 │   └── web-app/                 # Minimal browser demo
+├── tests/                       # node:test suite (stubs yt-dlp — no network needed)
 ├── scripts/
-│   └── smoke-test.mjs           # End-to-end check against a running instance
+│   └── smoke-test.mjs           # End-to-end check against a real yt-dlp + live sites
 ├── Dockerfile
 ├── render.yaml                  # Render Blueprint
 └── .env.example
@@ -171,11 +194,25 @@ Endpoints at a glance:
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/healthz` | Liveness check |
-| GET | `/media/info` | Metadata: title, thumbnail, duration, formats |
-| GET | `/media/direct-url` | Resolve the underlying CDN URL, no bytes proxied |
-| GET | `/media/download` | Download as MP4/MP3, streamed back |
+| GET | `/api/healthz` | Liveness check |
+| GET | `/api/capabilities` | yt-dlp version, ffmpeg/ffprobe, impersonation, loaded cookie jars |
+| GET | `/api/media/info` | Metadata: title, thumbnail, duration, live status, formats |
+| GET | `/api/media/direct-url` | Resolve the underlying CDN URL(s) + the headers they need, no bytes proxied |
+| GET | `/api/media/download` | Download as mp4/webm/mp3/m4a/opus/audio/auto, streamed back |
+| GET | `/api/media/extractors` | List/search the sites this yt-dlp build supports |
 | GET | `/metrics` | Prometheus metrics |
+
+### Making a stubborn site work
+
+| Symptom (`code` in the error body) | Fix |
+|---|---|
+| `auth_required` — login wall, age gate, "confirm you're not a bot" | Export cookies from a logged-in browser → `YTDLP_COOKIES_FILE`, or per-site jars in `YTDLP_COOKIES_DIR` (`youtube.com.txt`, `instagram.com.txt`, …) |
+| `forbidden_by_source` — blanket 403 from a cloud IP | `YTDLP_IMPERSONATE=chrome` (Docker image ships `yt-dlp[curl-cffi]`), or a proxy |
+| `geo_restricted` | `YTDLP_PROXY`, or `YTDLP_GEO_BYPASS_COUNTRY` |
+| `postprocessing_failed` | ffmpeg/ffprobe missing — check `/api/capabilities` |
+| `live_stream` | Retry with `allowLive=true` |
+| `format_unavailable` | Omit `format`, or pick one from `/api/media/info` |
+| Site needs specific extractor options | `YTDLP_EXTRACTOR_ARGS="youtube:player_client=android,web"` |
 
 ## License
 

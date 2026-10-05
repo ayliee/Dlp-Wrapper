@@ -44,33 +44,41 @@ function dlpHeaders() {
   return h;
 }
 
+// Errors carry { error, code, hint } — the hint is usually the actionable
+// half ("add cookies for this site", "retry with allowLive=true").
+async function dlpError(r, label) {
+  const { error, code, hint } = await r.json().catch(() => ({}));
+  const parts = [error || `${label}: HTTP ${r.status}`];
+  if (hint) parts.push(`(${hint})`);
+  const err = new Error(parts.join(' '));
+  err.code = code;
+  return err;
+}
+
 async function dlpInfo(url) {
   const r = await fetch(`${DLP_WRAPPER_BASE}/media/info?url=${encodeURIComponent(url)}`, { headers: dlpHeaders() });
-  if (!r.ok) {
-    const { error } = await r.json().catch(() => ({}));
-    throw new Error(error || `info: HTTP ${r.status}`);
-  }
+  if (!r.ok) throw await dlpError(r, 'info');
   return r.json();
 }
 
-async function dlpDirect(url, format = 'best') {
-  const r = await fetch(`${DLP_WRAPPER_BASE}/media/direct-url?url=${encodeURIComponent(url)}&format=${format}`, { headers: dlpHeaders() });
-  if (!r.ok) {
-    const { error } = await r.json().catch(() => ({}));
-    throw new Error(error || `direct: HTTP ${r.status}`);
-  }
+// Omitting `format` lets the API pick a selector that resolves on any kind
+// of source (muxed file, split streams, audio-only, HLS).
+async function dlpDirect(url, format = '') {
+  const qs = new URLSearchParams({ url, ...(format ? { format } : {}) });
+  const r = await fetch(`${DLP_WRAPPER_BASE}/media/direct-url?${qs}`, { headers: dlpHeaders() });
+  if (!r.ok) throw await dlpError(r, 'direct');
   return r.json();
 }
 
 async function dlpDownload(url, ext) {
   const r = await fetch(`${DLP_WRAPPER_BASE}/media/download?url=${encodeURIComponent(url)}&ext=${ext}`, { headers: dlpHeaders() });
-  if (!r.ok) {
-    const { error } = await r.json().catch(() => ({}));
-    throw new Error(error || `download: HTTP ${r.status}`);
-  }
-  const filename =
-    r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1] ??
-    `media.${ext}`;
+  if (!r.ok) throw await dlpError(r, 'download');
+  // Prefer the RFC 6266 form so non-ASCII titles survive.
+  const disposition = r.headers.get('content-disposition') ?? '';
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/)?.[1];
+  const filename = encoded
+    ? decodeURIComponent(encoded)
+    : (disposition.match(/filename="(.+?)"/)?.[1] ?? `media.${ext}`);
   return {
     filename,
     contentType: r.headers.get('content-type'),
@@ -147,7 +155,11 @@ client.on(Events.MessageCreate, async (message) => {
     const [info, direct] = await Promise.all([dlpInfo(url), dlpDirect(url)]);
     await message.reply({
       embeds: [buildEmbed(info)],
-      content: `**Direct stream** (no proxy): ${direct.urls[0]}`,
+      // HLS/DASH manifests and split video+audio can't be embedded as a
+      // plain link — fall back to telling the user to use /download.
+      content: direct.streams?.[0]?.isManifest || direct.requiresMerge
+        ? `**Direct stream**: ${direct.urls[0]}\n_(this is a ${direct.requiresMerge ? 'split video+audio' : 'live/HLS'} source — use the download command for a single playable file)_`
+        : `**Direct stream** (no proxy): ${direct.urls[0]}`,
     });
   } catch (err) {
     await message.reply({ content: `Couldn't fetch that: ${err.message}`, flags: MessageFlags.SuppressEmbeds });

@@ -68,6 +68,31 @@ function isPrivateIp(ip) {
 
 export class SsrfError extends Error {}
 
+// Self-hosters sometimes point this at media on their own LAN (a Jellyfin
+// box, an internal HLS origin). That's a legitimate use, but it's also
+// exactly what the SSRF guard exists to stop, so it's opt-in and loud.
+const ALLOW_PRIVATE_URLS = process.env.ALLOW_PRIVATE_URLS === 'true';
+
+/**
+ * Clean up whatever the caller pasted in.
+ *
+ * Share sheets and chat clients hand out URLs wrapped in <>, trailing
+ * punctuation, or with the scheme stripped ("youtu.be/xyz"). yt-dlp copes
+ * with a bare host; `new URL()` doesn't, so these used to come back as a
+ * flat "url must be a valid, absolute URL".
+ */
+export function normalizeInputUrl(raw) {
+  let value = String(raw ?? '').trim();
+  value = value.replace(/^<+|>+$/g, '').replace(/^["']|["']$/g, '').trim();
+  if (!value) return '';
+  // Scheme-relative ("//example.com/x") and schemeless ("example.com/x").
+  if (value.startsWith('//')) value = `https:${value}`;
+  else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    if (/^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:[/?#]|$)/i.test(value)) value = `https://${value}`;
+  }
+  return value;
+}
+
 /**
  * Reject anything but a public http(s) URL before it's handed to yt-dlp.
  * Note: this is defense-in-depth, not a guarantee — yt-dlp does its own DNS
@@ -87,8 +112,15 @@ export async function assertPublicHttpUrl(rawUrl) {
     throw new SsrfError('url must use http or https');
   }
 
-  const hostname = parsed.hostname;
-  if (!hostname || hostname === 'localhost') {
+  // IPv6 literals arrive bracketed ("[::1]") — strip for the IP checks.
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  if (!hostname) {
+    throw new SsrfError('url host is not allowed');
+  }
+
+  if (ALLOW_PRIVATE_URLS) return;
+
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
     throw new SsrfError('url host is not allowed');
   }
 

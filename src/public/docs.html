@@ -8,7 +8,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Dlp Wrapper — self-hosted media API</title>
-<meta name="description" content="Dlp Wrapper: a self-hosted REST API wrapping yt-dlp for metadata, direct CDN URLs, and MP4/MP3 downloads from 1,750+ sites." />
+<meta name="description" content="Dlp Wrapper: a self-hosted REST API wrapping yt-dlp for metadata, direct CDN URLs, and MP4/MP3/audio downloads from 1,750+ sites — video, audio and image sources alike." />
 <style>
   :root {
     --bg: #060606;
@@ -294,9 +294,18 @@
           <p class="group-label">Endpoints</p>
           <ul>
             <li><a href="#endpoint-healthz">GET /healthz</a></li>
+            <li><a href="#endpoint-capabilities">GET /capabilities</a></li>
             <li><a href="#endpoint-info">GET /media/info</a></li>
             <li><a href="#endpoint-direct-url">GET /media/direct-url</a></li>
             <li><a href="#endpoint-download">GET /media/download</a></li>
+            <li><a href="#endpoint-extractors">GET /media/extractors</a></li>
+          </ul>
+        </div>
+        <div class="group">
+          <p class="group-label">Sources</p>
+          <ul>
+            <li><a href="#sources">Working with every site</a></li>
+            <li><a href="#errors">Error codes</a></li>
           </ul>
         </div>
         <div class="group">
@@ -308,7 +317,7 @@
             <li><a href="#metrics">Metrics</a></li>
             <li><a href="#environment-variables">Environment variables</a></li>
             <li><a href="#security">Security notes</a></li>
-            <li><a href="#youtube">YouTube &amp; cookies</a></li>
+            <li><a href="#youtube">Cookies &amp; logins</a></li>
           </ul>
         </div>
         <div class="group">
@@ -360,46 +369,88 @@ npm start
         <p>Liveness check. No auth required. Returns:</p>
         <pre><code>{ "status": "ok" }</code></pre>
 
+        <h2 id="endpoint-capabilities">
+          <span class="badge get">GET</span>
+          <code>/api/capabilities</code>
+        </h2>
+        <p>What this particular install can actually do. Most &ldquo;site X doesn't work&rdquo; reports come down to the environment rather than the extractor — no ffmpeg, no cookies, no TLS impersonation — so check here first.</p>
+        <pre><code>{
+  "ytdlpVersion": "2025.09.26",
+  "ffmpeg": true,
+  "ffprobe": true,
+  "impersonation": false,
+  "impersonateTarget": null,
+  "cookieDomains": ["youtube.com", "instagram.com"],
+  "notes": []
+}</code></pre>
+
         <h2 id="endpoint-info">
           <span class="badge get">GET</span>
           <code>/api/media/info</code>
         </h2>
-        <p>Full metadata for any yt-dlp-supported URL — title, thumbnail, duration, uploader, and every available format.</p>
+        <p>Full metadata for any yt-dlp-supported URL — title, thumbnail, duration, uploader, live status, subtitle languages, and every available format. The response shape is identical whether the source is a video site, an audio host, or an image post, so clients need no per-site branching.</p>
         <table>
-          <tr><th>Param</th><th>Required</th><th>Description</th></tr>
-          <tr><td><code>url</code></td><td><span class="badge required">required</span></td><td>Source URL. Must be a public <code>http</code>/<code>https</code> address.</td></tr>
+          <tr><th>Param</th><th>Required</th><th>Default</th><th>Description</th></tr>
+          <tr><td><code>url</code></td><td><span class="badge required">required</span></td><td>—</td><td>Source URL. Public <code>http</code>/<code>https</code> only; a bare host like <code>youtu.be/abc</code> is accepted and upgraded to https.</td></tr>
+          <tr><td><code>playlist</code></td><td>optional</td><td><code>false</code></td><td>Return every entry of a playlist/album/channel/multi-clip post instead of just the first.</td></tr>
+          <tr><td><code>limit</code></td><td>optional</td><td><code>50</code></td><td>Max entries when <code>playlist=true</code>.</td></tr>
+          <tr><td><code>item</code></td><td>optional</td><td>—</td><td>1-based index of a single item inside a playlist/post.</td></tr>
         </table>
         <pre><code>curl -H "x-api-key: $KEY" \
   "$BASE/api/media/info?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ"</code></pre>
         <pre><code>{
+  "kind": "video",                 // video | audio | image | playlist | unknown
   "id": "dQw4w9WgXcQ",
   "title": "...",
-  "description": "...",
-  "thumbnail": "https://...",
+  "thumbnail": "https://...",      // largest available, even when the extractor only fills `thumbnails`
   "durationSeconds": 212,
-  "uploader": "...",
+  "uploader": "...",               // uploader / channel / creator / artist, whichever the site provides
   "webpageUrl": "https://...",
   "extractor": "youtube",
+  "uploadDate": "2009-10-25",
+  "isLive": false,
+  "liveStatus": "not_live",
+  "hasVideo": true,
+  "hasAudio": true,
+  "isPlaylist": false,
+  "subtitleLanguages": ["en"],
   "formats": [
-    { "formatId": "22", "ext": "mp4", "resolution": "1280x720", "note": null,
-      "filesizeApprox": 34521098, "vcodec": "avc1.64001F", "acodec": "mp4a.40.2",
-      "hasVideo": true, "hasAudio": true }
+    { "formatId": "22", "ext": "mp4", "resolution": "1280x720", "width": 1280, "height": 720,
+      "fps": 30, "protocol": "https", "filesizeApprox": 34521098, "tbr": 1500,
+      "vcodec": "avc1.64001F", "acodec": "mp4a.40.2",
+      "hasVideo": true, "hasAudio": true, "isManifest": false, "isDrm": false }
   ]
 }</code></pre>
+        <div class="callout">Sites that bundle several clips into one post (X/Twitter threads, Reddit galleries, TikTok photo carousels, Instagram multi-item posts) come back as the first playable item plus a <code>partOfPlaylist</code> summary. Pass <code>playlist=true</code> for the full list, then fetch a specific one with <code>item=N</code>. Storyboard/preview-grid formats are filtered out of <code>formats</code>.</div>
 
         <h2 id="endpoint-direct-url">
           <span class="badge get">GET</span>
           <code>/api/media/direct-url</code>
         </h2>
-        <p>Resolves the underlying CDN URL(s) without routing any bytes through this server. Good for Discord embeds or an HTML5 <code>&lt;video src&gt;</code> — some CDNs will 403 without the original request headers, in which case fall back to <code>/media/download</code>.</p>
+        <p>Resolves the underlying CDN URL(s) without routing any bytes through this server. Good for Discord embeds or an HTML5 <code>&lt;video src&gt;</code>.</p>
         <table>
           <tr><th>Param</th><th>Required</th><th>Default</th><th>Description</th></tr>
           <tr><td><code>url</code></td><td><span class="badge required">required</span></td><td>—</td><td>Source URL</td></tr>
-          <tr><td><code>format</code></td><td>optional</td><td><code>best</code></td><td>yt-dlp format selector</td></tr>
+          <tr><td><code>format</code></td><td>optional</td><td><code>b/bv*+ba/ba/bv*</code></td><td>yt-dlp format selector. The default prefers a single playable file and falls back through merge pairs, audio-only, then video-only, so it resolves on every kind of source. A selector the site can't satisfy is retried loosened instead of failing.</td></tr>
+          <tr><td><code>item</code></td><td>optional</td><td>—</td><td>1-based index inside a multi-item post</td></tr>
         </table>
         <pre><code>curl -H "x-api-key: $KEY" \
-  "$BASE/api/media/direct-url?url=https://vimeo.com/76979871&format=best"</code></pre>
-        <pre><code>{ "title": "...", "urls": ["https://cdn.example.com/..."] }</code></pre>
+  "$BASE/api/media/direct-url?url=https://vimeo.com/76979871"</code></pre>
+        <pre><code>{
+  "title": "...",
+  "extractor": "vimeo",
+  "isLive": false,
+  "urls": ["https://cdn.example.com/..."],
+  "streams": [
+    { "url": "https://cdn.example.com/...", "formatId": "http-1080p", "ext": "mp4",
+      "protocol": "https", "resolution": "1920x1080", "hasVideo": true, "hasAudio": true,
+      "isManifest": false,
+      "headers": { "User-Agent": "...", "Referer": "https://vimeo.com/" } }
+  ],
+  "requiresMerge": false,
+  "expiresAt": "2025-01-01T12:00:00.000Z"
+}</code></pre>
+        <div class="callout"><strong>Replay the <code>headers</code>.</strong> Instagram, TikTok, Facebook, Bilibili and friends 403 a direct URL fetched without the original <code>Referer</code>/<code>User-Agent</code>. When <code>isManifest</code> is true the URL is an HLS/DASH manifest and needs a player (hls.js, ffmpeg, VLC) rather than a plain GET; when <code>requiresMerge</code> is true video and audio are separate streams. In both cases <code>/media/download</code> does the work for you.</div>
 
         <h2 id="endpoint-download">
           <span class="badge get">GET</span>
@@ -409,12 +460,77 @@ npm start
         <table>
           <tr><th>Param</th><th>Required</th><th>Default</th><th>Description</th></tr>
           <tr><td><code>url</code></td><td><span class="badge required">required</span></td><td>—</td><td>Source URL</td></tr>
-          <tr><td><code>ext</code></td><td>optional</td><td><code>mp4</code></td><td><code>mp4</code> or <code>mp3</code></td></tr>
-          <tr><td><code>format</code></td><td>optional</td><td><code>bestvideo*+bestaudio/best</code></td><td>yt-dlp format selector. Only applies when <code>ext=mp4</code> — <code>mp3</code> always extracts <code>bestaudio/best</code>.</td></tr>
+          <tr><td><code>ext</code></td><td>optional</td><td><code>mp4</code></td><td><code>mp4</code>, <code>webm</code>, <code>mp3</code>, <code>m4a</code>, <code>opus</code>, <code>audio</code> (best audio, no re-encode) or <code>auto</code> (source container, no conversion — fastest and works everywhere)</td></tr>
+          <tr><td><code>format</code></td><td>optional</td><td>per-<code>ext</code> selector</td><td>yt-dlp format selector, overriding the default for that <code>ext</code></td></tr>
+          <tr><td><code>item</code></td><td>optional</td><td>—</td><td>1-based index inside a multi-item post</td></tr>
+          <tr><td><code>allowLive</code></td><td>optional</td><td><code>false</code></td><td>Allow recording a live stream. Off by default because a live download only ends at <code>YTDLP_DOWNLOAD_TIMEOUT_MS</code>.</td></tr>
         </table>
         <pre><code>curl -H "x-api-key: $KEY" -OJ \
-  "$BASE/api/media/download?url=https://vimeo.com/76979871&ext=mp3"</code></pre>
-        <p>This endpoint has its own stricter rate limit and concurrency cap (see below) since each request spins up a real ffmpeg/yt-dlp process.</p>
+  "$BASE/api/media/download?url=https://vimeo.com/76979871&amp;ext=mp3"</code></pre>
+        <div class="callout"><strong><code>ext</code> is best-effort, not a transcode promise.</strong> A webm/opus-only source asked for as <code>mp4</code> is remuxed when the codecs allow it and otherwise comes back in its original container — <code>Content-Type</code> and the filename always describe what's actually in the body, so check them rather than assuming. If the requested format doesn't exist on that site the request is retried with a looser selector instead of failing, and if a remux fails it's retried keeping the source container.</div>
+        <p>Filenames are sent RFC 6266-encoded, so non-ASCII titles survive intact:</p>
+        <pre><code>Content-Disposition: attachment; filename="_____ _____.mp4"; filename*=UTF-8''%D0%9F%D1%80%D0%B8%D0%BC%D0%B5%D1%80.mp4</code></pre>
+        <p>This endpoint has its own stricter rate limit and concurrency cap (see below) since each request spins up a real ffmpeg/yt-dlp process. Disconnecting mid-download kills the subprocess.</p>
+
+        <h2 id="endpoint-extractors">
+          <span class="badge get">GET</span>
+          <code>/api/media/extractors</code>
+        </h2>
+        <p>The list of sites this yt-dlp build supports, read straight from the binary — useful for checking a source before wiring it up.</p>
+        <table>
+          <tr><th>Param</th><th>Required</th><th>Default</th><th>Description</th></tr>
+          <tr><td><code>query</code></td><td>optional</td><td>—</td><td>Case-insensitive substring filter</td></tr>
+          <tr><td><code>limit</code></td><td>optional</td><td><code>100</code></td><td>Max names returned</td></tr>
+        </table>
+        <pre><code>curl -H "x-api-key: $KEY" "$BASE/api/media/extractors?query=tiktok"</code></pre>
+        <pre><code>{ "total": 1750, "matched": 8, "query": "tiktok",
+  "extractors": ["TikTok", "tiktok:collection", "tiktok:live", "tiktok:user", "vm.tiktok"] }</code></pre>
+
+        <h2 id="sources">Working with every site</h2>
+        <p>yt-dlp supports 1,750+ sites and they behave nothing alike. The API smooths over most of that for you:</p>
+        <ul class="plain">
+          <li><strong>Any media type</strong> — video, audio-only hosts (SoundCloud, Bandcamp, podcasts) and image posts all return the same shape, tagged with <code>kind</code>.</li>
+          <li><strong>Any format layout</strong> — progressive-only, split video+audio, HLS/DASH manifests, or extractors that expose a single bare URL and no format list at all.</li>
+          <li><strong>Multi-item posts</strong> — collapsed to the first item by default, fully listable with <code>playlist=true</code>.</li>
+          <li><strong>Fallback selectors</strong> — every default format selector degrades through muxed → merge → audio-only → video-only, and unsatisfiable selectors are retried loosened.</li>
+          <li><strong>Classified failures</strong> — a login wall, a geo-block and a dead link are three different status codes, not one generic 422.</li>
+        </ul>
+        <p>Three environment knobs cover the sites that still push back:</p>
+        <table>
+          <tr><th>Problem</th><th>Fix</th></tr>
+          <tr><td>Login walls, age gates, &ldquo;confirm you're not a bot&rdquo; (YouTube from a cloud IP, Instagram, X)</td><td><code>YTDLP_COOKIES_DIR</code> with a per-site jar — see <a href="#youtube">cookies</a></td></tr>
+          <tr><td>TLS-fingerprint blocking / blanket 403s</td><td><code>YTDLP_IMPERSONATE=chrome</code> (needs <code>yt-dlp[curl-cffi]</code>; the bundled Dockerfile installs it)</td></tr>
+          <tr><td>Geo-restrictions, datacentre IP bans</td><td><code>YTDLP_PROXY</code>, or <code>YTDLP_GEO_BYPASS_COUNTRY</code></td></tr>
+        </table>
+        <p>Site-specific tuning (e.g. YouTube player clients) goes through <code>YTDLP_EXTRACTOR_ARGS</code>, newline- or <code>|</code>-separated:</p>
+        <pre><code>YTDLP_EXTRACTOR_ARGS="youtube:player_client=android,web|generic:impersonate"</code></pre>
+
+        <h2 id="errors">Error codes</h2>
+        <p>Every failure returns JSON with a stable <code>code</code>, a human <code>error</code> message, usually an actionable <code>hint</code>, and the cleaned-up yt-dlp output in <code>detail</code>:</p>
+        <pre><code>{
+  "error": "The source site requires an authenticated session for this media",
+  "code": "auth_required",
+  "hint": "Export cookies from a logged-in browser and set YTDLP_COOKIES_FILE (or drop a &lt;domain&gt;.txt into YTDLP_COOKIES_DIR).",
+  "detail": "[instagram] 123: Requested content is not available, rate-limit reached or login required"
+}</code></pre>
+        <table>
+          <tr><th>HTTP</th><th>code</th><th>Meaning</th></tr>
+          <tr><td>400</td><td><code>invalid_url</code> / <code>missing_url</code> / <code>invalid_format</code> / <code>invalid_ext</code> / <code>invalid_item</code></td><td>Bad request parameters</td></tr>
+          <tr><td>400</td><td><code>unsupported_url</code></td><td>No extractor handles this URL</td></tr>
+          <tr><td>401</td><td><code>unauthorized</code></td><td>Missing/incorrect <code>API_KEY</code></td></tr>
+          <tr><td>403</td><td><code>auth_required</code></td><td>Login, age gate, members-only, bot check — add cookies</td></tr>
+          <tr><td>403</td><td><code>forbidden_by_source</code></td><td>Plain HTTP 403 from the site — try cookies, a proxy, or impersonation</td></tr>
+          <tr><td>404</td><td><code>not_found</code></td><td>Removed, private-deleted, or never existed</td></tr>
+          <tr><td>413</td><td><code>file_too_large</code></td><td>Over <code>YTDLP_MAX_FILESIZE</code></td></tr>
+          <tr><td>422</td><td><code>live_stream</code></td><td>Live — retry with <code>allowLive=true</code></td></tr>
+          <tr><td>422</td><td><code>format_unavailable</code></td><td>No stream matched the selector, even after the loosened retry</td></tr>
+          <tr><td>422</td><td><code>extraction_failed</code></td><td>Anything else yt-dlp refused</td></tr>
+          <tr><td>429</td><td><code>rate_limited</code> / <code>quota_exceeded</code> / <code>server_busy</code></td><td>This API's limits, or the source site's</td></tr>
+          <tr><td>451</td><td><code>geo_restricted</code> / <code>drm_protected</code></td><td>Blocked by region or by DRM</td></tr>
+          <tr><td>500</td><td><code>postprocessing_failed</code></td><td>ffmpeg/ffprobe missing or the merge failed — check <code>/api/capabilities</code></td></tr>
+          <tr><td>502</td><td><code>network_error</code></td><td>Couldn't reach the site (TLS/DNS/connection)</td></tr>
+          <tr><td>504</td><td><code>timeout</code></td><td>Extraction exceeded its timeout</td></tr>
+        </table>
 
         <h2 id="rate-limits">Rate limits &amp; concurrency</h2>
         <p>Two layers protect the container from being overwhelmed: a request-rate limit per client IP, and a hard cap on concurrent yt-dlp/ffmpeg processes.</p>
@@ -471,7 +587,21 @@ npm start
           <tr><td><code>METRICS_KEY</code></td><td>unset (open)</td><td>Require this header to scrape <code>/metrics</code></td></tr>
           <tr><td><code>YTDLP_MAX_FILESIZE</code></td><td>unset (no limit)</td><td>yt-dlp size syntax, e.g. <code>500M</code></td></tr>
           <tr><td><code>YTDLP_DOWNLOAD_TIMEOUT_MS</code></td><td>600000</td><td>Kill downloads that run longer than this</td></tr>
-          <tr><td><code>YTDLP_COOKIES_FILE</code></td><td>unset</td><td>Path to a Netscape-format cookies file — required for YouTube</td></tr>
+          <tr><td><code>YTDLP_INFO_TIMEOUT_MS</code></td><td>60000</td><td>Timeout for metadata/direct-url extraction</td></tr>
+          <tr><td><code>YTDLP_COOKIES_FILE</code></td><td>unset</td><td>One Netscape-format cookies file used for every site</td></tr>
+          <tr><td><code>YTDLP_COOKIES_DIR</code></td><td>unset</td><td>Directory of per-site jars named <code>&lt;domain&gt;.txt</code> — preferred when you need more than one site</td></tr>
+          <tr><td><code>YTDLP_COOKIES_FROM_BROWSER</code></td><td>unset</td><td>Passed to <code>--cookies-from-browser</code> (only useful on a desktop host)</td></tr>
+          <tr><td><code>YTDLP_IMPERSONATE</code></td><td>unset</td><td>TLS impersonation target, e.g. <code>chrome</code>. Ignored with a warning if the build lacks curl-cffi.</td></tr>
+          <tr><td><code>YTDLP_PROXY</code></td><td>unset</td><td><code>http(s)://</code> or <code>socks5://</code> proxy for all extraction</td></tr>
+          <tr><td><code>YTDLP_GEO_BYPASS</code> / <code>YTDLP_GEO_BYPASS_COUNTRY</code></td><td>true / unset</td><td>Geo-restriction bypass headers, optionally pinned to a country code</td></tr>
+          <tr><td><code>YTDLP_EXTRACTOR_ARGS</code></td><td>unset</td><td>Per-extractor options, newline- or <code>|</code>-separated</td></tr>
+          <tr><td><code>YTDLP_EXTRA_ARGS</code></td><td>unset</td><td>Extra raw yt-dlp flags appended to every call</td></tr>
+          <tr><td><code>YTDLP_CONCURRENT_FRAGMENTS</code></td><td>4</td><td>Parallel fragment downloads — the big speed win on HLS/DASH sites</td></tr>
+          <tr><td><code>YTDLP_RETRIES</code> / <code>YTDLP_EXTRACTOR_RETRIES</code> / <code>YTDLP_SOCKET_TIMEOUT</code></td><td>3 / 2 / 20</td><td>Network resilience knobs</td></tr>
+          <tr><td><code>YTDLP_FORCE_IPV4</code></td><td>false</td><td>Set true when a host's IPv6 range is blocked by sites</td></tr>
+          <tr><td><code>FFMPEG_LOCATION</code></td><td>unset (PATH)</td><td>Directory containing <code>ffmpeg</code>/<code>ffprobe</code></td></tr>
+          <tr><td><code>ALLOW_PRIVATE_URLS</code></td><td>false</td><td><strong>Disables the SSRF guard.</strong> Only for pointing the API at media on your own LAN.</td></tr>
+          <tr><td><code>PLAYLIST_MAX_ITEMS</code></td><td>200</td><td>Ceiling for the <code>limit</code> parameter</td></tr>
           <tr><td><code>YTDLP_BIN</code></td><td><code>yt-dlp</code></td><td>Override only if the binary lives somewhere non-standard</td></tr>
           <tr><td><code>LOG_LEVEL</code></td><td>info</td><td>trace / debug / info / warn / error / fatal</td></tr>
         </table>
@@ -486,28 +616,43 @@ npm start
         </ul>
         <div class="callout">If a web app calls this API, don't ship <code>API_KEY</code> to client-side JS — proxy the request through your own backend instead. Anything sent to a browser is extractable.</div>
 
-        <h2 id="youtube">YouTube &amp; cookies</h2>
-        <p>YouTube requires cookies from a real browser session on any cloud IP — this is a yt-dlp limitation, not specific to this API.</p>
-        <ol class="plain">
-          <li>Export cookies in Netscape format (e.g. via a browser extension like "Get cookies.txt LOCALLY")</li>
-          <li>Mount the file into the container, e.g. at <code>/secrets/cookies.txt</code></li>
-          <li>Set <code>YTDLP_COOKIES_FILE=/secrets/cookies.txt</code></li>
-        </ol>
+        <h2 id="youtube">Cookies &amp; logins</h2>
+        <p>Login walls are the single most common reason a source fails: YouTube demands a browser session from any cloud IP, and Instagram, X, Facebook, Bilibili, niche forums and most paywalled sites want an account. That's a yt-dlp/site reality, not an API limitation — the fix is always the same: give it cookies from a real logged-in browser.</p>
+        <p><strong>One site</strong> — export cookies in Netscape format (e.g. the &ldquo;Get cookies.txt LOCALLY&rdquo; extension), mount the file, and point at it:</p>
+        <pre><code>YTDLP_COOKIES_FILE=/secrets/cookies.txt</code></pre>
+        <p><strong>Several sites</strong> — a single jar shared across sites is useless at best and account-flagging at worst, so use a directory of per-site jars named after the domain they belong to:</p>
+        <pre><code>/secrets/cookies/
+  youtube.com.txt
+  instagram.com.txt
+  x.com.txt
+
+YTDLP_COOKIES_DIR=/secrets/cookies</code></pre>
+        <p>The jar whose domain is the longest suffix match for the request host wins (<code>youtube.com.txt</code> also covers <code>m.youtube.com</code>), falling back to <code>YTDLP_COOKIES_FILE</code> if one is set. <code>GET /api/capabilities</code> lists the domains currently loaded.</p>
         <p>From there, cookie handling is managed automatically:</p>
         <ul class="plain">
-          <li><strong>Writable working copy</strong> — the file is copied to a writable temp path at startup. yt-dlp rewrites its cookie jar after every run as tokens rotate, which silently fails against a read-only mount (e.g. Render Secret Files) — working from a copy keeps that refresh working.</li>
-          <li><strong>Re-sync on change</strong> — the source file is re-checked on an interval (<code>COOKIE_SYNC_INTERVAL_MS</code>, default 5 minutes); dropping in a freshly exported file picks it up without a restart.</li>
-          <li><strong>Expiry warnings</strong> — the cookie jar's expiry timestamps are parsed and logged as a warning when entries are expired or expiring within <code>COOKIE_EXPIRY_WARNING_MS</code> (default 24h).</li>
+          <li><strong>Writable working copy</strong> — each jar is copied to a writable temp path at startup. yt-dlp rewrites its cookie jar after every run as tokens rotate, which silently fails against a read-only mount (e.g. Render Secret Files) — working from a copy keeps that refresh working.</li>
+          <li><strong>Re-sync on change</strong> — sources are re-checked on an interval (<code>COOKIE_SYNC_INTERVAL_MS</code>, default 5 minutes); dropping in a freshly exported file picks it up without a restart, and new <code>&lt;domain&gt;.txt</code> files are picked up too.</li>
+          <li><strong>Expiry warnings</strong> — expiry timestamps are parsed per jar and logged as a warning when entries are expired or expiring within <code>COOKIE_EXPIRY_WARNING_MS</code> (default 24h), so you know <em>which</em> site to re-export.</li>
         </ul>
-        <p>That cookie session is shared by every caller of the API — treat it accordingly. None of this logs into anything on your behalf; you still export cookies from a real logged-in browser yourself.</p>
+        <p>Those sessions are shared by every caller of the API — treat them accordingly. None of this logs into anything on your behalf; you still export cookies from a real logged-in browser yourself.</p>
 
         <h2 id="examples-curl">curl</h2>
         <pre><code>BASE="https://your-app.onrender.com/api"
 KEY="your-secret-key"
 
+# metadata from any supported site
 curl -H "x-api-key: $KEY" "$BASE/media/info?url=https://vimeo.com/76979871"
+curl -H "x-api-key: $KEY" "$BASE/media/info?url=https://soundcloud.com/forss/flickermood"
+# every clip in a multi-item post
+curl -H "x-api-key: $KEY" "$BASE/media/info?url=https://x.com/user/status/123&playlist=true"
+# CDN URL + the headers its CDN expects
 curl -H "x-api-key: $KEY" "$BASE/media/direct-url?url=https://vimeo.com/76979871"
-curl -H "x-api-key: $KEY" -OJ "$BASE/media/download?url=https://vimeo.com/76979871&ext=mp4"</code></pre>
+# download: mp4, audio-as-mp3, or untouched source container
+curl -H "x-api-key: $KEY" -OJ "$BASE/media/download?url=https://vimeo.com/76979871&ext=mp4"
+curl -H "x-api-key: $KEY" -OJ "$BASE/media/download?url=https://soundcloud.com/forss/flickermood&ext=mp3"
+curl -H "x-api-key: $KEY" -OJ "$BASE/media/download?url=https://www.tiktok.com/@u/video/123&ext=auto"
+# is a site supported?
+curl -H "x-api-key: $KEY" "$BASE/media/extractors?query=bilibili"</code></pre>
 
         <h2 id="examples-js">Web app (fetch)</h2>
         <p>Call this from your own backend, not directly from the browser, so the API key never reaches client-side JS:</p>

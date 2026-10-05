@@ -77,8 +77,8 @@
           // 1. metadata
           const infoR = await fetch(`${API_BASE}/media/info?url=${encodeURIComponent(url)}`, { headers: headers() });
           if (!infoR.ok) {
-            const { error } = await infoR.json().catch(() => ({}));
-            throw new Error(error || `HTTP ${infoR.status}`);
+            const { error, hint } = await infoR.json().catch(() => ({}));
+            throw new Error([error || `HTTP ${infoR.status}`, hint].filter(Boolean).join(' — '));
           }
           const info = await infoR.json();
 
@@ -86,8 +86,8 @@
           setStatus('Resolving direct stream URL…');
           const directR = await fetch(`${API_BASE}/media/direct-url?url=${encodeURIComponent(url)}&format=best`, { headers: headers() });
           if (!directR.ok) {
-            const { error } = await directR.json().catch(() => ({}));
-            throw new Error(error || `HTTP ${directR.status}`);
+            const { error, hint } = await directR.json().catch(() => ({}));
+            throw new Error([error || `HTTP ${directR.status}`, hint].filter(Boolean).join(' — '));
           }
           const direct = await directR.json();
 
@@ -104,6 +104,7 @@
                 <strong>Uploader</strong><span>${info.uploader ?? '–'}</span>
                 <strong>Duration</strong><span>${info.durationSeconds != null ? Math.round(info.durationSeconds) + 's' : '–'}</span>
                 <strong>Extractor</strong><span>${info.extractor ?? '–'}</span>
+                <strong>Type</strong><span>${info.kind ?? '–'}${info.isLive ? ' (live)' : ''}</span>
                 <strong>Formats</strong><span>${info.formats.length}</span>
               </div>
               <div class="actions">
@@ -116,8 +117,16 @@
           `;
 
           document.getElementById('play').onclick = () => {
+            const stream = direct.streams?.[0] ?? {};
             const url = direct.urls[0];
-            const isAudio = (info.extractor ?? '').toLowerCase().includes('soundcloud') || /\.(mp3|m4a|ogg)/.test(url);
+            // kind comes straight from the API, so this works for audio
+            // hosts and image posts too — no per-site guessing needed.
+            const isAudio = info.kind === 'audio' || (stream.hasAudio && !stream.hasVideo);
+            if (stream.isManifest || direct.requiresMerge) {
+              document.getElementById('player').innerHTML =
+                `<p>This source is ${direct.requiresMerge ? 'split into separate video and audio streams' : 'an HLS/DASH manifest'}, which a bare &lt;video&gt; tag can't play. Use the download buttons instead.</p>`;
+              return;
+            }
             document.getElementById('player').innerHTML = isAudio
               ? `<audio controls src="${url}"></audio>`
               : `<video controls src="${url}"></video>`;

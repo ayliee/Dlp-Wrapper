@@ -19,8 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Dedicated venv so pip never writes to system Python and we can pin yt-dlp
 # independently. yt-dlp updates daily — re-running the build always pulls
 # the latest.
+# The [curl-cffi] extra adds TLS/JA3 impersonation, which is what gets past
+# sites that 403 anything that doesn't look like a real browser (TikTok,
+# several Cloudflare-fronted hosts). Enable it at runtime with
+# YTDLP_IMPERSONATE=chrome.
 RUN python3 -m venv /opt/ytdlp-venv \
-    && /opt/ytdlp-venv/bin/pip install --no-cache-dir --upgrade yt-dlp
+    && /opt/ytdlp-venv/bin/pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]"
 ENV YTDLP_BIN=/opt/ytdlp-venv/bin/yt-dlp
 
 WORKDIR /app

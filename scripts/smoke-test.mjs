@@ -8,8 +8,13 @@
 // Usage:  node scripts/smoke-test.mjs
 // Env:
 //   SMOKE_URL          — the source URL to test (defaults to a known public test video)
+//   SMOKE_URLS         — comma-separated extra sources to run /media/info against,
+//                        for checking a spread of extractors in one go
 //   SMOKE_API_KEY      — if set, sent as x-api-key on every request
 //   SMOKE_PORT         — port to run the server on (default: 0 = random)
+//
+// For the offline test suite (no network, no yt-dlp binary required) run
+// `npm test` instead — this script deliberately talks to real sites.
 //
 // The script intentionally downloads a tiny MP3 + tiny MP4 so the test stays
 // fast even on slow connections. It writes the downloaded files to
@@ -39,11 +44,30 @@ const TEST_URL =
   // ~62s, public, no auth required.
   'https://vimeo.com/76979871';
 
+// Extra sources to sanity-check metadata extraction against. Anything that
+// fails for an environmental reason (login wall, site rate limit, network)
+// is reported as a warning rather than a failure — those say nothing about
+// whether this code works.
+const EXTRA_URLS = (process.env.SMOKE_URLS ?? 'https://soundcloud.com/forss/flickermood')
+  .split(',')
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+const ENVIRONMENTAL_CODES = new Set([
+  'auth_required',
+  'forbidden_by_source',
+  'rate_limited',
+  'network_error',
+  'geo_restricted',
+  'timeout',
+]);
+
 const API_KEY = process.env.SMOKE_API_KEY ?? '';
 const PORT = process.env.SMOKE_PORT ?? '0';
 
 const COL = { ok: '\x1b[32m', err: '\x1b[31m', info: '\x1b[36m', reset: '\x1b[0m' };
 const ok = (msg) => console.log(`${COL.ok}✓${COL.reset} ${msg}`);
+const warn = (msg) => console.log(`\x1b[33m!\x1b[0m ${msg}`);
 const info = (msg) => console.log(`${COL.info}•${COL.reset} ${msg}`);
 const fail = (msg) => {
   console.error(`${COL.err}✗${COL.reset} ${msg}`);
@@ -264,7 +288,83 @@ async function main() {
       }
     }
 
-    // 6. Auth: 401 when a key is configured but missing ----------------------
+    // 6. capabilities --------------------------------------------------------
+    {
+      const r = await fetchJson(`${BASE}/capabilities`, { headers: buildHeaders() });
+      if (r.status === 200 && r.json?.ytdlpVersion) {
+        ok(`/capabilities: yt-dlp ${r.json.ytdlpVersion}, ffmpeg=${r.json.ffmpeg}, ffprobe=${r.json.ffprobe}, cookies=[${r.json.cookieDomains.join(', ')}]`);
+        if (!r.json.ffmpeg) warn('ffmpeg missing — merged formats and mp3/m4a conversion cannot work');
+        passed++;
+      } else {
+        fail(`/capabilities returned ${r.status}: ${r.body.toString().slice(0, 200)}`);
+        failed++;
+      }
+    }
+
+    // 7. extractors ------------------------------------------------------------
+    {
+      const r = await fetchJson(`${BASE}/media/extractors?query=youtube`, { headers: buildHeaders() });
+      if (r.status === 200 && r.json?.total > 100 && r.json.matched > 0) {
+        ok(`/media/extractors: ${r.json.total} extractors available, ${r.json.matched} match "youtube"`);
+        passed++;
+      } else {
+        fail(`/media/extractors returned ${r.status}: ${r.body.toString().slice(0, 200)}`);
+        failed++;
+      }
+    }
+
+    // 8. error classification --------------------------------------------------
+    {
+      const r = await fetchJson(
+        `${BASE}/media/info?url=${encodeURIComponent('https://example.com/definitely-not-media')}`,
+        { headers: buildHeaders() },
+      );
+      if (r.status >= 400 && r.status < 500 && r.json?.code) {
+        ok(`Unsupported URL classified as ${r.status} ${r.json.code}`);
+        passed++;
+      } else {
+        fail(`Expected a classified 4xx for a junk URL, got ${r.status} ${r.body.toString().slice(0, 200)}`);
+        failed++;
+      }
+    }
+
+    // 9. ext=auto (no conversion — the path that works on every source) --------
+    {
+      info('Downloading with ext=auto...');
+      const r = await fetchJson(
+        `${BASE}/media/download?url=${encodeURIComponent(TEST_URL)}&ext=auto`,
+        { headers: buildHeaders() },
+      );
+      const disposition = r.headers['content-disposition'] ?? '';
+      if (r.status !== 200 || r.body.length < 4096) {
+        fail(`/media/download?ext=auto returned ${r.status} (${r.body.length} bytes)`);
+        failed++;
+      } else if (!disposition.includes("filename*=UTF-8''")) {
+        fail(`/media/download?ext=auto missing RFC 6266 filename: ${disposition}`);
+        failed++;
+      } else {
+        ok(`/media/download?ext=auto: ${(r.body.length / 1024).toFixed(1)} KiB, ${r.headers['content-type']}`);
+        passed++;
+      }
+    }
+
+    // 10. a spread of other extractors ----------------------------------------
+    for (const extraUrl of EXTRA_URLS) {
+      const r = await fetchJson(`${BASE}/media/info?url=${encodeURIComponent(extraUrl)}`, {
+        headers: buildHeaders(),
+      });
+      if (r.status === 200 && r.json?.formats?.length > 0) {
+        ok(`/media/info on ${r.json.extractor ?? extraUrl}: kind=${r.json.kind}, formats=${r.json.formats.length}`);
+        passed++;
+      } else if (ENVIRONMENTAL_CODES.has(r.json?.code)) {
+        warn(`${extraUrl} → ${r.status} ${r.json.code} (environmental, not a code failure): ${r.json.error}`);
+      } else {
+        fail(`/media/info on ${extraUrl} returned ${r.status}: ${r.body.toString().slice(0, 300)}`);
+        failed++;
+      }
+    }
+
+    // 11. Auth: 401 when a key is configured but missing ----------------------
     // /healthz is intentionally unauthenticated (liveness probes need no
     // creds), so we test the auth gate against a protected endpoint instead.
     if (API_KEY) {

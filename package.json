@@ -1,13 +1,14 @@
 {
   "name": "dlp-wrapper",
-  "version": "1.1.0",
-  "description": "A self-hosted REST API wrapping yt-dlp for fetching metadata, resolving direct CDN URLs, and downloading media (MP4/MP3) from 1,750+ sites. Drop-in for use in web apps and Discord bots.",
+  "version": "1.2.0",
+  "description": "A self-hosted REST API wrapping yt-dlp: metadata, direct CDN URLs, and video/audio downloads from 1,750+ sites, normalized into one response shape with classified errors. Drop-in for web apps and Discord bots.",
   "type": "module",
   "main": "src/index.mjs",
   "scripts": {
     "start": "node --enable-source-maps src/index.mjs",
     "dev": "node --watch --enable-source-maps src/index.mjs",
-    "smoke-test": "node scripts/smoke-test.mjs"
+    "smoke-test": "node scripts/smoke-test.mjs",
+    "test": "node --test tests/**/*.test.mjs"
   },
   "engines": {
     "node": ">=20"

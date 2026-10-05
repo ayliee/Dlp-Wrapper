@@ -37,6 +37,14 @@ export const cacheEvents = new client.Counter({
   registers: [registry],
 });
 
+export const extractionResults = new client.Counter({
+  name: 'dlpwrapper_extraction_results_total',
+  help: 'Outcome of each yt-dlp extraction, by classified result code',
+  // 'ok' | 'auth_required' | 'geo_restricted' | 'not_found' | ... (see lib/ytdlpErrors.mjs)
+  labelNames: ['result'],
+  registers: [registry],
+});
+
 export const quotaRejections = new client.Counter({
   name: 'dlpwrapper_quota_rejected_total',
   help: 'Requests rejected for exceeding a per-IP quota',

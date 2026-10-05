@@ -46,6 +46,21 @@ services:
       # yt-dlp size syntax, e.g. "500M" or "2G".
       - key: YTDLP_MAX_FILESIZE
         value: 500M
+      # TLS impersonation — helps with sites that block non-browser clients.
+      # The Dockerfile installs yt-dlp with curl-cffi, so this works as-is.
+      - key: YTDLP_IMPERSONATE
+        value: chrome
+      # Cookies are what make login-walled sites (YouTube from a cloud IP,
+      # Instagram, X) work at all. Add them as Render Secret Files, then
+      # point one of these at them:
+      #   - a single jar:      YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt
+      #   - per-site jars:     YTDLP_COOKIES_DIR=/etc/secrets
+      #     (named youtube.com.txt, instagram.com.txt, x.com.txt, ...)
+      # - key: YTDLP_COOKIES_DIR
+      #   value: /etc/secrets
+      # Parallel fragment downloads — the big speed win on HLS/DASH sites.
+      - key: YTDLP_CONCURRENT_FRAGMENTS
+        value: 4
       # Concurrency caps — keep in step with the plan's CPU/RAM.
       - key: DLP_MAX_CONCURRENT_DOWNLOADS
         value: 2

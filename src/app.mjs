@@ -119,7 +119,7 @@ app.use('/api', generalLimiter);
 app.use('/api', router);
 
 app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found' });
+  res.status(404).json({ error: 'Not found', code: 'not_found' });
 });
 
 // Final error guard — always JSON, never an HTML error page.
@@ -127,7 +127,7 @@ app.use((_req, res) => {
 app.use((err, req, res, _next) => {
   req.log?.error({ err }, 'Unhandled error');
   if (res.headersSent) return;
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ error: 'Internal server error', code: 'internal_error' });
 });
 
 export default app;
