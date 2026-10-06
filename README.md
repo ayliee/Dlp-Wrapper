@@ -63,6 +63,28 @@ npm start
 # → listening on http://localhost:8080
 ```
 
+### Try it in a browser
+
+With the server running, open **<http://localhost:8080/test>** — a built-in test console for every endpoint: paste a URL, inspect metadata and the format table, resolve CDN URLs (with a player preview), and download in any supported `ext` with a progress bar. It's served from the same origin as the API, so CORS never gets in the way, and errors are shown with their `code`/`hint`.
+
+### Share it over a Cloudflare tunnel
+
+To reach that console (or the API) from your phone, a teammate, or a Discord bot — without opening a port or buying a domain:
+
+```bash
+npm start            # terminal 1
+npm run tunnel       # terminal 2 → https://<random>.trycloudflare.com
+```
+
+The script checks the API is up, starts a Cloudflare Quick Tunnel against it, and prints the public URL plus direct links to `/test`, `/api/healthz` and `/api/capabilities`. It needs [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on `PATH` (`brew install cloudflared`, `winget install Cloudflare.cloudflared`, or `npm i -g cloudflared`) and prints install instructions if it's missing. No Cloudflare account is required for a quick tunnel.
+
+```bash
+npm run tunnel 3000                      # non-default port
+TUNNEL_HOSTNAME=dlp.example.com npm run tunnel   # named tunnel on your own domain
+```
+
+A quick tunnel URL is public to anyone holding the link and changes on every restart — **set `API_KEY` before sharing one**.
+
 Requires Node.js 20+, plus `yt-dlp` and `ffmpeg`/`ffprobe` on `PATH` (all bundled if you run it via Docker instead — see below). Check what the running instance found with:
 
 ```bash
@@ -174,13 +196,15 @@ dlp-wrapper/
 │   │   ├── health.mjs           # GET /healthz, /capabilities
 │   │   └── media.mjs            # GET /media/info, /media/direct-url, /media/download, /media/extractors
 │   └── public/
-│       └── docs.html            # Built-in documentation page, served at GET /
+│       ├── docs.html            # Built-in documentation page, served at GET /
+│       └── test.html            # Interactive test console, served at GET /test
 ├── examples/
 │   ├── discord-bot/             # Minimal discord.js integration
 │   └── web-app/                 # Minimal browser demo
 ├── tests/                       # node:test suite (stubs yt-dlp — no network needed)
 ├── scripts/
-│   └── smoke-test.mjs           # End-to-end check against a real yt-dlp + live sites
+│   ├── smoke-test.mjs           # End-to-end check against a real yt-dlp + live sites
+│   └── tunnel.mjs               # `npm run tunnel` — public URL via Cloudflare Quick Tunnel
 ├── Dockerfile
 ├── render.yaml                  # Render Blueprint
 └── .env.example
@@ -194,6 +218,8 @@ Endpoints at a glance:
 
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/` | Built-in documentation page |
+| GET | `/test` | Interactive test console for every endpoint |
 | GET | `/api/healthz` | Liveness check |
 | GET | `/api/capabilities` | yt-dlp version, ffmpeg/ffprobe, impersonation, loaded cookie jars |
 | GET | `/api/media/info` | Metadata: title, thumbnail, duration, live status, formats |

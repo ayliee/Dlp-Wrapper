@@ -93,6 +93,14 @@ app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'docs.html'));
 });
 
+// Interactive test console. Same-origin with the API, so it works over a
+// tunnel/deployed URL without touching ALLOWED_ORIGINS. The page itself is
+// static — the API key is typed in by whoever opens it and only travels in
+// the requests it makes, never baked into the HTML.
+app.get(['/test', '/console'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'test.html'));
+});
+
 // Prometheus scrape endpoint. Optionally gated behind METRICS_KEY, the same
 // pattern as API_KEY on /media/* — left unset, it's open (typical when
 // scraping happens over a private network rather than the public internet).

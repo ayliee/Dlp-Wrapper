@@ -8,7 +8,8 @@
     "start": "node --enable-source-maps src/index.mjs",
     "dev": "node --watch --enable-source-maps src/index.mjs",
     "smoke-test": "node scripts/smoke-test.mjs",
-    "test": "node --test tests/**/*.test.mjs"
+    "test": "node --test tests/**/*.test.mjs",
+    "tunnel": "node scripts/tunnel.mjs"
   },
   "engines": {
     "node": ">=20"

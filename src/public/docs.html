@@ -285,6 +285,7 @@
         <div class="group">
           <p class="group-label">Start here</p>
           <ul>
+            <li><a href="/test">▸ Test console</a></li>
             <li><a href="#overview">Overview</a></li>
             <li><a href="#quick-start">Quick start</a></li>
             <li><a href="#authentication">Authentication</a></li>
@@ -333,6 +334,7 @@
           <ul>
             <li><a href="#deploy-render">Render</a></li>
             <li><a href="#deploy-docker">Docker</a></li>
+            <li><a href="#tunnel">Cloudflare tunnel</a></li>
           </ul>
         </div>
       </nav>
@@ -345,6 +347,7 @@
           <h1>Dlp Wrapper</h1>
           <p>A self-hosted REST API wrapping <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noopener">yt-dlp</a>. Fetch metadata, resolve direct CDN URLs, or download MP4/MP3 from 1,750+ sites — drop it into a web app or a Discord bot over plain HTTP.</p>
           <div class="hero-cmd">$ curl -H "x-api-key: $KEY" "$BASE/api/media/info?url=..."<span class="cursor"></span></div>
+          <p>Prefer clicking to curling? <a href="/test">Open the test console</a> — a browser UI for every endpoint on this instance, served from this same origin.</p>
         </header>
 
         <h2 id="quick-start">Quick start</h2>
@@ -686,6 +689,19 @@ docker run --rm -p 8080:8080 \
   -e PORT=8080 \
   -e API_KEY=your-secret-key \
   dlp-wrapper</code></pre>
+
+        <h2 id="tunnel">Share it — Cloudflare tunnel</h2>
+        <p>To reach this instance (and the <a href="/test">test console</a>) from your phone, a teammate, or a Discord bot without opening a port or buying a domain, run a Cloudflare Quick Tunnel next to it:</p>
+        <pre><code>npm start            # terminal 1 — the API
+npm run tunnel       # terminal 2 — prints https://&lt;random&gt;.trycloudflare.com</code></pre>
+        <p>The script verifies the API is up, starts <code>cloudflared</code> against it, and prints the public URL with direct links to <code>/test</code>, <code>/api/healthz</code> and <code>/api/capabilities</code>. No Cloudflare account is needed for a quick tunnel; <code>cloudflared</code> just has to be on <code>PATH</code>:</p>
+        <pre><code>brew install cloudflared                      # macOS
+winget install --id Cloudflare.cloudflared    # Windows
+npm i -g cloudflared                          # anywhere with npm
+sudo apt install cloudflared                  # Debian/Ubuntu (after adding Cloudflare's apt repo)</code></pre>
+        <pre><code>npm run tunnel 3000                               # non-default port
+TUNNEL_HOSTNAME=dlp.example.com npm run tunnel    # named tunnel on your own domain</code></pre>
+        <div class="callout"><strong>A quick tunnel URL is public.</strong> Anyone with the link reaches your instance, and the hostname changes on every restart — set <code>API_KEY</code> before sharing one, and keep <code>ALLOW_PRIVATE_URLS</code> off so nobody can aim it at your LAN.</div>
 
         <footer>
           <span>Dlp Wrapper</span>

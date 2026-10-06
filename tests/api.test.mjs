@@ -280,3 +280,16 @@ test('auth: API_KEY gates media endpoints and accepts a bearer token', async () 
     delete process.env.API_KEY;
   }
 });
+
+test('static pages: docs and the test console are served', async () => {
+  const docs = await fetch(`${base.replace('/api', '')}/`);
+  assert.equal(docs.status, 200);
+  assert.match(docs.headers.get('content-type'), /text\/html/);
+
+  const console_ = await fetch(`${base.replace('/api', '')}/test`);
+  assert.equal(console_.status, 200);
+  const html = await console_.text();
+  assert.match(html, /test console/i);
+  // The console must never ship a baked-in key.
+  assert.ok(!html.includes('API_KEY='), 'test console should not embed a key');
+});
